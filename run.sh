@@ -19,19 +19,14 @@ fi
 # 2. Detect and activate asdf (if installed)
 if [ -f "$HOME/.asdf/asdf.sh" ]; then
   . "$HOME/.asdf/asdf.sh"
-elif [ -f "$HOME/.asdf/bin/asdf" ]; then
-  . "$HOME/.asdf/bin/asdf"
-elif command -v asdf &> /dev/null; then
-  # asdf already in command-v path
-  :
 fi
 
-# 3. Explicit fallback to prepend user shims to PATH just in case activation is partial
+# 3. Explicit fallback to prepend user shims and bins to PATH
 if [ -d "$HOME/.asdf/shims" ]; then
-  export PATH="$HOME/.asdf/shims:$PATH"
+  export PATH="$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH"
 fi
 if [ -d "$HOME/.local/share/mise/shims" ]; then
-  export PATH="$HOME/.local/share/mise/shims:$PATH"
+  export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
 fi
 
 # Execute the Elixir bot using exec to replace the shell process
