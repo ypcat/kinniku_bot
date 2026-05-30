@@ -1,0 +1,20 @@
+[Unit]
+Description=Muscle Bot Telegram Workout Tracker
+After=network.target
+
+[Service]
+Type=simple
+User=peilun
+WorkingDirectory=/home/peilun/muscle
+ExecStart=/home/peilun/muscle/run.sh
+Restart=on-failure
+RestartSec=5
+# Set HOME and PATH explicitly so asdf/mise and Elixir/Erlang are found correctly
+Environment=HOME=/home/peilun
+Environment=PATH=/home/peilun/.local/bin:/home/peilun/.asdf/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Output logs to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
