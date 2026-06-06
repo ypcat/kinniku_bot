@@ -296,6 +296,10 @@ defmodule Telegram do
     )
   end
 
+  def delete_message(chat_id, msg_id) do
+    api("deleteMessage", %{chat_id: chat_id, message_id: msg_id})
+  end
+
   def get_updates(offset) do
     api("getUpdates", %{offset: offset, timeout: 30})
   end
@@ -359,6 +363,7 @@ defmodule Bot do
     chat_id = msg["chat"]["id"]
     text = msg["text"] || ""
     username = get_in(msg, ["from", "username"]) || ""
+    msg_id = msg["message_id"]
 
     cond do
       String.starts_with?(text, "/input") -> start_input(chat_id, username)
@@ -366,7 +371,7 @@ defmodule Bot do
       String.starts_with?(text, "/query") -> start_query(chat_id)
       String.starts_with?(text, "/help") or String.starts_with?(text, "/start") -> send_help(chat_id)
       String.starts_with?(text, "/cancel") -> cancel(chat_id)
-      true -> handle_text_input(chat_id, text, username)
+      true -> handle_text_input(chat_id, text, username, msg_id)
     end
   end
 
@@ -407,6 +412,42 @@ defmodule Bot do
     Telegram.send_message(chat_id, "❌ Cancelled.")
   end
 
+  # ---- Single "anchor" message per flow ----
+  #
+  # Instead of spamming a new message for every step, each flow keeps one
+  # message that we edit in place. `render/4` edits an existing message id
+  # (falling back to a fresh send if it's gone); `wizard/4` does the same but
+  # stashes the id under "_mid" in the flow's data so callbacks/text steps can
+  # keep editing the same message. Pass `buttons` to show an inline keyboard,
+  # or `nil`/omit to clear any existing keyboard.
+
+  defp render(chat_id, mid, text, buttons \\ nil) do
+    opts =
+      if buttons,
+        do: Telegram.inline_keyboard(buttons),
+        else: %{reply_markup: %{inline_keyboard: []}}
+
+    if is_integer(mid) do
+      case Telegram.edit_message(chat_id, mid, text, opts) do
+        {:ok, _} -> mid
+        _ -> send_and_id(chat_id, text, opts)
+      end
+    else
+      send_and_id(chat_id, text, opts)
+    end
+  end
+
+  defp wizard(chat_id, data, text, buttons \\ nil) do
+    Map.put(data, "_mid", render(chat_id, data["_mid"], text, buttons))
+  end
+
+  defp send_and_id(chat_id, text, opts) do
+    case Telegram.send_message(chat_id, text, opts) do
+      {:ok, %{"message_id" => mid}} -> mid
+      _ -> nil
+    end
+  end
+
   # ============================================================================
   # /input flow: name → exercise (paginated menu) → reps → sets → load → confirm
   # ============================================================================
@@ -419,23 +460,18 @@ defmodule Bot do
       UsernameMapping.has_mapping?(username) ->
         mapped_name = UsernameMapping.get_mapped_name(username)
         data = %{"date" => Date.to_string(Date.utc_today()), "name" => mapped_name}
+        data = show_exercise_menu(chat_id, 0, data)
         put_state(chat_id, %{flow: :input, step: :exercise_menu, data: data})
-        send_exercise_menu(chat_id, 0)
 
       tg_name in Enum.map(existing_names, &String.downcase/1) ->
         matched = Enum.find(existing_names, fn n -> String.downcase(n) == tg_name end)
         UsernameMapping.save_mapping(username, matched)
         data = %{"date" => Date.to_string(Date.utc_today()), "name" => matched}
+        data = show_exercise_menu(chat_id, 0, data)
         put_state(chat_id, %{flow: :input, step: :exercise_menu, data: data})
-        send_exercise_menu(chat_id, 0)
 
       true ->
         # New user — ask to map to existing name or create new
-        put_state(chat_id, %{flow: :input, step: :pick_name, data: %{
-          "date" => Date.to_string(Date.utc_today()),
-          "tg_name" => tg_name
-        }})
-
         buttons =
           existing_names
           |> Enum.map(fn name ->
@@ -444,15 +480,18 @@ defmodule Bot do
 
         buttons = buttons ++ [[%{text: "➕ New: #{tg_name}", callback_data: "iname_new"}]]
 
-        Telegram.send_message(
-          chat_id,
-          "👤 <b>Who are you?</b>\nPick your name or create new:",
-          Telegram.inline_keyboard(buttons)
-        )
+        data = %{"date" => Date.to_string(Date.utc_today()), "tg_name" => tg_name}
+        data = wizard(chat_id, data, "👤 <b>Who are you?</b>\nPick your name or create new:", buttons)
+        put_state(chat_id, %{flow: :input, step: :pick_name, data: data})
     end
   end
 
-  defp send_exercise_menu(chat_id, page) do
+  # Edit/send the flow's anchor to show the paginated exercise menu.
+  defp show_exercise_menu(chat_id, page, data) do
+    wizard(chat_id, data, "🏋️ <b>Pick exercise:</b>", exercise_menu_buttons(page))
+  end
+
+  defp exercise_menu_buttons(page) do
     exercises = Sheets.get_exercises_by_recency()
     per_page = @exercises_per_page
     total_pages = max(div(length(exercises) + per_page - 1, per_page), 1)
@@ -473,21 +512,20 @@ defmodule Bot do
     nav = nav ++ [%{text: "#{page + 1}/#{total_pages}", callback_data: "noop"}]
     nav = if page < total_pages - 1, do: nav ++ [%{text: "➡️", callback_data: "iex_p:#{page + 1}"}], else: nav
 
-    buttons = buttons ++ [
+    buttons ++ [
       nav,
       [%{text: "➕ New exercise", callback_data: "iex_new"}],
       [%{text: "📋 Copy last day's workout", callback_data: "input_copy_last"}]
     ]
-
-    Telegram.send_message(
-      chat_id,
-      "🏋️ <b>Pick exercise:</b>",
-      Telegram.inline_keyboard(buttons)
-    )
   end
 
-  defp handle_text_input(chat_id, text, _username) do
-    case get_state(chat_id) do
+  defp handle_text_input(chat_id, text, _username, user_msg_id) do
+    state = get_state(chat_id)
+    # Drop the user's typed reply so the chat stays clean — the anchor message
+    # already reflects what they entered. Best-effort (needs delete rights).
+    if state, do: delete_msg(chat_id, user_msg_id)
+
+    case state do
       %{flow: :input, step: step, data: data} ->
         handle_input_step(chat_id, step, text, data)
 
@@ -502,31 +540,34 @@ defmodule Bot do
     end
   end
 
+  defp delete_msg(chat_id, mid) when is_integer(mid), do: Telegram.delete_message(chat_id, mid)
+  defp delete_msg(_chat_id, _mid), do: :ok
+
   # Input: new exercise name typed
   defp handle_input_step(chat_id, :new_exercise, text, data) do
     data = Map.put(data, "exercise", String.trim(text))
+    data = wizard(chat_id, data, "🏋️ <b>#{data["exercise"]}</b>\nHow many <b>reps</b>?")
     put_state(chat_id, %{flow: :input, step: :rep, data: data})
-    Telegram.send_message(chat_id, "How many <b>reps</b>?")
   end
 
   # Input: new name typed
   defp handle_input_step(chat_id, :new_name, text, data) do
     name = String.trim(text)
     data = data |> Map.put("name", name) |> Map.delete("tg_name")
+    data = show_exercise_menu(chat_id, 0, data)
     put_state(chat_id, %{flow: :input, step: :exercise_menu, data: data})
-    send_exercise_menu(chat_id, 0)
   end
 
   defp handle_input_step(chat_id, :rep, text, data) do
     data = Map.put(data, "rep", String.trim(text))
+    data = wizard(chat_id, data, "How many <b>sets</b>?")
     put_state(chat_id, %{flow: :input, step: :set, data: data})
-    Telegram.send_message(chat_id, "How many <b>sets</b>?")
   end
 
   defp handle_input_step(chat_id, :set, text, data) do
     data = Map.put(data, "set", String.trim(text))
+    data = wizard(chat_id, data, "Load in <b>kg</b>? (send 0 or - for bodyweight)")
     put_state(chat_id, %{flow: :input, step: :load, data: data})
-    Telegram.send_message(chat_id, "Load in <b>kg</b>? (send 0 or - for bodyweight)")
   end
 
   defp handle_input_step(chat_id, :load, text, data) do
@@ -539,11 +580,11 @@ defmodule Bot do
     case Sheets.append_row(row) do
       %{status: 200} ->
         clear_state(chat_id)
-        Telegram.send_message(chat_id, "✅ Entry saved!\n\n#{format_entry(data)}")
+        wizard(chat_id, data, "✅ Entry saved!\n\n#{format_entry(data)}")
 
       resp ->
         clear_state(chat_id)
-        Telegram.send_message(chat_id, "❌ Failed to save: #{inspect(resp.body)}")
+        wizard(chat_id, data, "❌ Failed to save: #{inspect(resp.body)}")
     end
   end
 
@@ -557,57 +598,109 @@ defmodule Bot do
 
   defp start_edit(chat_id, username) do
     name = UsernameMapping.get_mapped_name(username)
-    rows = Sheets.get_data_rows()
+    show_edit_picker(chat_id, name, %{})
+  end
 
+  # List the user's last 10 entries as a picker. Reuses the passed-in anchor
+  # (via data["_mid"]) so e.g. "Copy & Edit" stays on the same message.
+  defp show_edit_picker(chat_id, name, data) do
     my_rows =
-      rows
+      Sheets.get_data_rows()
       |> Enum.filter(fn {_idx, row} ->
         Enum.at(row, 1, "") |> String.downcase() == String.downcase(name)
       end)
       |> Enum.take(-10)
 
     if my_rows == [] do
-      Telegram.send_message(chat_id, "No entries found for <b>#{name}</b>.")
+      clear_state(chat_id)
+      wizard(chat_id, data, "No entries found for <b>#{name}</b>.")
     else
       buttons =
         my_rows
         |> Enum.map(fn {idx, row} ->
-          ex = Enum.at(row, 2, "?")
-          rep = Enum.at(row, 3, "")
-          set = Enum.at(row, 4, "")
-          load = Enum.at(row, 5, "")
-          load_s = if load in ["", nil], do: "bw", else: "#{load}kg"
-          label = "#{ex} #{rep}×#{set} @#{load_s}"
-          [%{text: label, callback_data: "edit_row_#{idx}"}]
+          [%{text: entry_label(row), callback_data: "edit_row_#{idx}"}]
         end)
 
-      put_state(chat_id, %{flow: :edit, step: :pick_row, data: %{name: name}})
-
-      Telegram.send_message(
-        chat_id,
-        "📝 <b>Select an entry to edit</b> (last 10):",
-        Telegram.inline_keyboard(buttons)
-      )
+      data = Map.put(data, :name, name)
+      data = wizard(chat_id, data, "📝 <b>Select an entry to edit</b> (last 10):", buttons)
+      put_state(chat_id, %{flow: :edit, step: :pick_row, data: data})
     end
   end
 
+  # The per-item editing menu — always shows which entry is being edited so the
+  # message keeps that context across edits.
+  defp show_edit_item(chat_id, data) do
+    field_buttons =
+      @columns
+      |> Enum.with_index()
+      |> Enum.map(fn {col, idx} -> %{text: col, callback_data: "efield_#{idx}"} end)
+      |> Enum.chunk_every(2)
+
+    buttons = field_buttons ++ [[%{text: "✅ Done", callback_data: "edit_done"}]]
+
+    text =
+      "📝 <b>Editing:</b> #{entry_label(data.row)}\n\n" <>
+        "Tap a field, or type e.g. <code>rep=10 load=50</code>"
+
+    wizard(chat_id, data, text, buttons)
+  end
+
+  # Fetch a sheet row by its 1-based row index, padded to 6 columns.
+  defp fetch_row(row_idx) do
+    case Enum.find(Sheets.get_data_rows(), fn {idx, _row} -> idx == row_idx end) do
+      {_idx, row} -> row ++ List.duplicate("", max(0, 6 - length(row)))
+      _ -> List.duplicate("", 6)
+    end
+  end
+
+  # Compact one-line label for an entry: date + exercise + reps×sets, load
+  # appended only when not bodyweight.
+  defp entry_label(row) do
+    date = Enum.at(row, 0, "")
+    ex = Enum.at(row, 2, "?")
+    rep = Enum.at(row, 3, "")
+    set = Enum.at(row, 4, "")
+    load = Enum.at(row, 5, "")
+    load_part = if load in ["", nil], do: "", else: " @#{load}kg"
+    "#{date} #{ex} #{rep}×#{set}#{load_part}"
+  end
+
+  # Text in the per-item menu: "rep=10 load=50" sets fields directly.
+  defp handle_edit_step(chat_id, :editing, text, data) do
+    edits =
+      text
+      |> parse_edits()
+      |> Enum.map(fn {k, v} -> {col_index(k), v} end)
+      |> Enum.reject(fn {idx, _v} -> idx == nil end)
+
+    row =
+      Enum.reduce(edits, data.row, fn {idx, v}, row ->
+        val = normalize_value(idx, String.trim(v))
+
+        case apply_edit(row, data.row_idx, idx, val) do
+          {:ok, new_row} -> new_row
+          {:error, _} -> row
+        end
+      end)
+
+    data = show_edit_item(chat_id, Map.put(data, :row, row))
+    put_state(chat_id, %{flow: :edit, step: :editing, data: data})
+  end
+
+  # A field button was tapped, then a bare value typed.
   defp handle_edit_step(chat_id, :enter_value, text, data) do
     col_idx = data.col_idx
-    row_idx = data.row_idx
-    sheet = MuscleConfig.sheet_name()
-    col_letter = Enum.at(~w[A B C D E F], col_idx, "A")
-    range = "#{sheet}!#{col_letter}#{row_idx}"
+    val = normalize_value(col_idx, String.trim(text))
 
-    new_val = String.trim(text)
+    case apply_edit(data.row, data.row_idx, col_idx, val) do
+      {:ok, row} ->
+        data = data |> Map.put(:row, row) |> Map.delete(:col_idx)
+        data = show_edit_item(chat_id, data)
+        put_state(chat_id, %{flow: :edit, step: :editing, data: data})
 
-    case Sheets.update_range(range, [new_val]) do
-      %{status: 200} ->
+      {:error, resp} ->
         clear_state(chat_id)
-        Telegram.send_message(chat_id, "✅ Updated <b>#{Enum.at(@columns, col_idx)}</b> to <b>#{new_val}</b>.")
-
-      resp ->
-        clear_state(chat_id)
-        Telegram.send_message(chat_id, "❌ Update failed: #{inspect(resp.body)}")
+        wizard(chat_id, data, "❌ Update failed: #{inspect(resp.body)}")
     end
   end
 
@@ -615,26 +708,75 @@ defmodule Bot do
     Telegram.send_message(chat_id, "Unexpected input. Use /cancel to restart.")
   end
 
+  # Write one cell and return the row with that column replaced locally.
+  defp apply_edit(row, row_idx, col_idx, value) do
+    sheet = MuscleConfig.sheet_name()
+    col_letter = Enum.at(~w[A B C D E F], col_idx, "A")
+    range = "#{sheet}!#{col_letter}#{row_idx}"
+
+    case Sheets.update_range(range, [value]) do
+      %{status: 200} -> {:ok, List.replace_at(row, col_idx, value)}
+      resp -> {:error, resp}
+    end
+  end
+
+  # Bodyweight sentinels collapse to empty for the load column.
+  defp normalize_value(5, v), do: if(v in ["0", "-", "bw"], do: "", else: v)
+  defp normalize_value(_idx, v), do: v
+
+  # Parse "rep=10 set=3 exercise=bench press" into [{"rep","10"}, ...].
+  # Tokens without "=" are appended to the previous value (multi-word values).
+  defp parse_edits(text) do
+    text
+    |> String.split()
+    |> Enum.reduce([], fn tok, acc ->
+      case String.split(tok, "=", parts: 2) do
+        [k, v] -> [{k, v} | acc]
+        [frag] ->
+          case acc do
+            [{k, v} | rest] -> [{k, v <> " " <> frag} | rest]
+            [] -> acc
+          end
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp col_index(key) do
+    case key |> String.trim() |> String.downcase() do
+      "date" -> 0
+      "name" -> 1
+      "exercise" -> 2
+      "ex" -> 2
+      "rep" -> 3
+      "reps" -> 3
+      "set" -> 4
+      "sets" -> 4
+      "load" -> 5
+      "load kg" -> 5
+      "kg" -> 5
+      "weight" -> 5
+      _ -> nil
+    end
+  end
+
   # ============================================================================
   # /query flow — results grouped by date & name for mobile
   # ============================================================================
 
   defp start_query(chat_id) do
-    put_state(chat_id, %{flow: :query, step: :pick_filter, data: %{}})
-
-    Telegram.send_message(
-      chat_id,
-      "🔍 <b>Query workout data</b>\nChoose a filter:",
-      Telegram.inline_keyboard([
+    data =
+      wizard(chat_id, %{}, "🔍 <b>Query workout data</b>\nChoose a filter:", [
         [%{text: "📅 Today", callback_data: "query_today"}],
         [%{text: "📆 Last 7 days", callback_data: "query_week"}],
         [%{text: "🏋️ By exercise", callback_data: "query_exercise"}],
         [%{text: "📋 Last 20 entries", callback_data: "query_recent"}]
       ])
-    )
+
+    put_state(chat_id, %{flow: :query, step: :pick_filter, data: data})
   end
 
-  defp handle_query_step(chat_id, :enter_exercise, text, _data) do
+  defp handle_query_step(chat_id, :enter_exercise, text, data) do
     exercise = String.trim(text) |> String.downcase()
     rows = Sheets.get_data_rows()
 
@@ -645,8 +787,9 @@ defmodule Bot do
       end)
       |> Enum.take(-30)
 
+    mid = data["_mid"]
     clear_state(chat_id)
-    send_query_results(chat_id, matches, "exercise \"#{exercise}\"")
+    send_query_results(chat_id, mid, matches, "exercise \"#{exercise}\"")
   end
 
   defp handle_query_step(chat_id, _step, _text, _data) do
@@ -664,8 +807,8 @@ defmodule Bot do
       %{flow: :input, data: data} ->
         UsernameMapping.save_mapping(username, name)
         data = data |> Map.put("name", name) |> Map.delete("tg_name")
+        data = show_exercise_menu(chat_id, 0, data)
         put_state(chat_id, %{flow: :input, step: :exercise_menu, data: data})
-        send_exercise_menu(chat_id, 0)
       _ ->
         Telegram.send_message(chat_id, "Session expired. Send /input again.")
     end
@@ -677,8 +820,8 @@ defmodule Bot do
         tg_name = Map.get(data, "tg_name", "")
         UsernameMapping.save_mapping(username, tg_name)
         data = data |> Map.put("name", tg_name) |> Map.delete("tg_name")
+        data = show_exercise_menu(chat_id, 0, data)
         put_state(chat_id, %{flow: :input, step: :exercise_menu, data: data})
-        send_exercise_menu(chat_id, 0)
       _ ->
         Telegram.send_message(chat_id, "Session expired. Send /input again.")
     end
@@ -690,52 +833,24 @@ defmodule Bot do
         # Resolve full name from sheet if truncated
         full = resolve_exercise(exercise)
         data = Map.put(data, "exercise", full)
+        data = wizard(chat_id, data, "🏋️ <b>#{full}</b>\nHow many <b>reps</b>?")
         put_state(chat_id, %{flow: :input, step: :rep, data: data})
-        Telegram.send_message(chat_id, "🏋️ <b>#{full}</b>\nHow many <b>reps</b>?")
       _ ->
         Telegram.send_message(chat_id, "Session expired. Send /input again.")
     end
   end
 
   defp handle_callback(chat_id, msg_id, "iex_p:" <> page_str, _username) do
+    # Pagination simply re-renders the same anchor message with the new page.
     page = String.to_integer(page_str)
-    # Edit the existing message with the new page
-    exercises = Sheets.get_exercises_by_recency()
-    per_page = @exercises_per_page
-    total_pages = max(div(length(exercises) + per_page - 1, per_page), 1)
-    page = min(page, total_pages - 1)
-    page_items = Enum.slice(exercises, page * per_page, per_page)
-
-    buttons =
-      page_items
-      |> Enum.map(fn ex ->
-        short = String.slice(ex, 0, 40)
-        [%{text: ex, callback_data: "iex:#{short}"}]
-      end)
-
-    nav = []
-    nav = if page > 0, do: nav ++ [%{text: "⬅️", callback_data: "iex_p:#{page - 1}"}], else: nav
-    nav = nav ++ [%{text: "#{page + 1}/#{total_pages}", callback_data: "noop"}]
-    nav = if page < total_pages - 1, do: nav ++ [%{text: "➡️", callback_data: "iex_p:#{page + 1}"}], else: nav
-
-    buttons = buttons ++ [
-      nav,
-      [%{text: "➕ New exercise", callback_data: "iex_new"}],
-      [%{text: "📋 Copy last day's workout", callback_data: "input_copy_last"}]
-    ]
-
-    Telegram.edit_message(
-      chat_id, msg_id,
-      "🏋️ <b>Pick exercise:</b>",
-      Telegram.inline_keyboard(buttons)
-    )
+    render(chat_id, msg_id, "🏋️ <b>Pick exercise:</b>", exercise_menu_buttons(page))
   end
 
   defp handle_callback(chat_id, _msg_id, "iex_new", _username) do
     case get_state(chat_id) do
-      %{flow: :input} = state ->
-        put_state(chat_id, %{state | step: :new_exercise})
-        Telegram.send_message(chat_id, "Type the new exercise name:")
+      %{flow: :input, data: data} = state ->
+        data = wizard(chat_id, data, "Type the new exercise name:")
+        put_state(chat_id, %{state | step: :new_exercise, data: data})
       _ ->
         Telegram.send_message(chat_id, "Session expired. Send /input again.")
     end
@@ -746,7 +861,7 @@ defmodule Bot do
       %{flow: :input, data: %{"name" => name} = data} ->
         case Sheets.get_last_workout_day_entries(name) do
           [] ->
-            Telegram.send_message(chat_id, "⚠️ No previous workout found for <b>#{name}</b>.")
+            wizard(chat_id, data, "⚠️ No previous workout found for <b>#{name}</b>.")
 
           last_entries ->
             today = Date.to_string(Date.utc_today())
@@ -776,18 +891,18 @@ defmodule Bot do
             Confirm copying these entries to today (<b>#{today}</b>)?
             """
 
-            put_state(chat_id, %{flow: :input, step: :confirm_copy_last, data: Map.put(data, "copy_entries", new_entries)})
+            data = Map.put(data, "copy_entries", new_entries)
 
-            Telegram.send_message(
-              chat_id,
-              msg,
-              Telegram.inline_keyboard([
+            data =
+              wizard(chat_id, data, msg, [
                 [
                   %{text: "✅ Copy & Save", callback_data: "input_copy_confirm"},
-                  %{text: "❌ Cancel", callback_data: "input_cancel"}
-                ]
+                  %{text: "✏️ Copy & Edit", callback_data: "input_copy_edit"}
+                ],
+                [%{text: "❌ Cancel", callback_data: "input_cancel"}]
               ])
-            )
+
+            put_state(chat_id, %{flow: :input, step: :confirm_copy_last, data: data})
         end
 
       _ ->
@@ -797,7 +912,7 @@ defmodule Bot do
 
   defp handle_callback(chat_id, _msg_id, "input_copy_confirm", _username) do
     case get_state(chat_id) do
-      %{flow: :input, step: :confirm_copy_last, data: %{"copy_entries" => new_entries}} ->
+      %{flow: :input, step: :confirm_copy_last, data: %{"copy_entries" => new_entries} = data} ->
         case Sheets.append_rows(new_entries) do
           %{status: 200} ->
             clear_state(chat_id)
@@ -813,14 +928,29 @@ defmodule Bot do
               end)
               |> Enum.join("\n")
 
-            Telegram.send_message(
-              chat_id,
-              "✅ <b>Copied last workout successfully!</b>\n\n#{formatted}"
-            )
+            wizard(chat_id, data, "✅ <b>Copied last workout successfully!</b>\n\n#{formatted}")
 
           resp ->
             clear_state(chat_id)
-            Telegram.send_message(chat_id, "❌ Failed to copy workout: #{inspect(resp.body)}")
+            wizard(chat_id, data, "❌ Failed to copy workout: #{inspect(resp.body)}")
+        end
+
+      _ ->
+        Telegram.send_message(chat_id, "No pending copy operation. Use /input to start.")
+    end
+  end
+
+  # Copy last day's entries, then drop straight into the edit picker for them.
+  defp handle_callback(chat_id, _msg_id, "input_copy_edit", _username) do
+    case get_state(chat_id) do
+      %{flow: :input, step: :confirm_copy_last, data: %{"copy_entries" => new_entries} = data} ->
+        case Sheets.append_rows(new_entries) do
+          %{status: 200} ->
+            show_edit_picker(chat_id, data["name"], %{"_mid" => data["_mid"]})
+
+          resp ->
+            clear_state(chat_id)
+            wizard(chat_id, data, "❌ Failed to copy workout: #{inspect(resp.body)}")
         end
 
       _ ->
@@ -836,11 +966,11 @@ defmodule Bot do
         case Sheets.append_row(row) do
           %{status: 200} ->
             clear_state(chat_id)
-            Telegram.send_message(chat_id, "✅ Entry saved!\n\n#{format_entry(data)}")
+            wizard(chat_id, data, "✅ Entry saved!\n\n#{format_entry(data)}")
 
           resp ->
             clear_state(chat_id)
-            Telegram.send_message(chat_id, "❌ Failed to save: #{inspect(resp.body)}")
+            wizard(chat_id, data, "❌ Failed to save: #{inspect(resp.body)}")
         end
 
       _ ->
@@ -854,51 +984,54 @@ defmodule Bot do
 
   # -- Edit callbacks --
 
-  defp handle_callback(chat_id, _msg_id, "edit_row_" <> row_idx_str, _username) do
+  defp handle_callback(chat_id, msg_id, "edit_row_" <> row_idx_str, _username) do
     row_idx = String.to_integer(row_idx_str)
-
-    buttons =
-      @columns
-      |> Enum.with_index()
-      |> Enum.map(fn {col, idx} ->
-        [%{text: col, callback_data: "edit_col_#{row_idx}_#{idx}"}]
-      end)
+    row = fetch_row(row_idx)
 
     case get_state(chat_id) do
-      %{} = state ->
-        put_state(chat_id, %{state | step: :pick_col, data: Map.put(state.data, :row_idx, row_idx)})
-      _ -> nil
+      %{flow: :edit} = state ->
+        data = state.data |> Map.put(:row_idx, row_idx) |> Map.put(:row, row)
+        data = show_edit_item(chat_id, data)
+        put_state(chat_id, %{state | step: :editing, data: data})
+      _ ->
+        render(chat_id, msg_id, "Session expired. Send /edit again.")
     end
-
-    Telegram.send_message(
-      chat_id,
-      "Which field do you want to edit?",
-      Telegram.inline_keyboard(buttons)
-    )
   end
 
-  defp handle_callback(chat_id, _msg_id, "edit_col_" <> rest, _username) do
-    [row_idx_str, col_idx_str] = String.split(rest, "_")
-    row_idx = String.to_integer(row_idx_str)
+  defp handle_callback(chat_id, msg_id, "efield_" <> col_idx_str, _username) do
     col_idx = String.to_integer(col_idx_str)
     col_name = Enum.at(@columns, col_idx)
 
     case get_state(chat_id) do
-      %{} = state ->
-        put_state(chat_id, %{
-          state
-          | step: :enter_value,
-            data: Map.merge(state.data, %{row_idx: row_idx, col_idx: col_idx})
-        })
-        Telegram.send_message(chat_id, "Enter new value for <b>#{col_name}</b>:")
+      %{flow: :edit, data: data} = state ->
+        data = Map.put(data, :col_idx, col_idx)
+
+        data =
+          wizard(
+            chat_id,
+            data,
+            "📝 <b>Editing:</b> #{entry_label(data.row)}\n\nEnter new value for <b>#{col_name}</b>:"
+          )
+
+        put_state(chat_id, %{state | step: :enter_value, data: data})
       _ ->
-        Telegram.send_message(chat_id, "Session expired. Please send /edit again.")
+        render(chat_id, msg_id, "Session expired. Send /edit again.")
+    end
+  end
+
+  defp handle_callback(chat_id, _msg_id, "edit_done", _username) do
+    case get_state(chat_id) do
+      %{flow: :edit, data: data} ->
+        clear_state(chat_id)
+        wizard(chat_id, data, "✅ <b>Saved.</b>\n\n#{entry_label(data.row)}")
+      _ ->
+        :ok
     end
   end
 
   # -- Query callbacks --
 
-  defp handle_callback(chat_id, _msg_id, "query_today", _username) do
+  defp handle_callback(chat_id, msg_id, "query_today", _username) do
     today = Date.to_string(Date.utc_today())
     rows = Sheets.get_data_rows()
 
@@ -907,10 +1040,10 @@ defmodule Bot do
       |> Enum.filter(fn {_idx, row} -> Enum.at(row, 0, "") == today end)
 
     clear_state(chat_id)
-    send_query_results(chat_id, matches, "today (#{today})")
+    send_query_results(chat_id, msg_id, matches, "today (#{today})")
   end
 
-  defp handle_callback(chat_id, _msg_id, "query_week", _username) do
+  defp handle_callback(chat_id, msg_id, "query_week", _username) do
     week_ago = Date.add(Date.utc_today(), -7) |> Date.to_string()
     rows = Sheets.get_data_rows()
 
@@ -919,25 +1052,25 @@ defmodule Bot do
       |> Enum.filter(fn {_idx, row} -> Enum.at(row, 0, "") >= week_ago end)
 
     clear_state(chat_id)
-    send_query_results(chat_id, matches, "last 7 days")
+    send_query_results(chat_id, msg_id, matches, "last 7 days")
   end
 
   defp handle_callback(chat_id, _msg_id, "query_exercise", _username) do
     case get_state(chat_id) do
       %{} = state ->
-        put_state(chat_id, %{state | step: :enter_exercise})
-        Telegram.send_message(chat_id, "Enter exercise name (or part of it) to search:")
+        data = wizard(chat_id, state.data, "Enter exercise name (or part of it) to search:")
+        put_state(chat_id, %{state | step: :enter_exercise, data: data})
       _ ->
         Telegram.send_message(chat_id, "Session expired. Please send /query again.")
     end
   end
 
-  defp handle_callback(chat_id, _msg_id, "query_recent", _username) do
+  defp handle_callback(chat_id, msg_id, "query_recent", _username) do
     rows = Sheets.get_data_rows()
     matches = Enum.take(rows, -20)
 
     clear_state(chat_id)
-    send_query_results(chat_id, matches, "last 20 entries")
+    send_query_results(chat_id, msg_id, matches, "last 20 entries")
   end
 
   defp handle_callback(_chat_id, _msg_id, "noop", _username), do: :ok
@@ -963,10 +1096,12 @@ defmodule Bot do
     |> Enum.find(short, fn ex -> String.starts_with?(ex, short) end)
   end
 
-  # Query results: grouped by date & name, mobile-friendly
-  defp send_query_results(chat_id, matches, label) do
+  # Query results: grouped by date & name, mobile-friendly.
+  # Edits the flow's anchor (`mid`) so the filter menu collapses into results;
+  # overflow chunks are sent as follow-up messages.
+  defp send_query_results(chat_id, mid, matches, label) do
     if matches == [] do
-      Telegram.send_message(chat_id, "No results for <b>#{label}</b>.")
+      render(chat_id, mid, "No results for <b>#{label}</b>.")
     else
       # Group by {date, name}
       grouped =
@@ -999,11 +1134,11 @@ defmodule Bot do
 
       # Telegram message limit is 4096 chars
       if String.length(msg) > 4000 do
-        msg
-        |> chunk_message(4000)
-        |> Enum.each(fn chunk -> Telegram.send_message(chat_id, chunk) end)
+        [first | rest] = chunk_message(msg, 4000)
+        render(chat_id, mid, first)
+        Enum.each(rest, fn chunk -> Telegram.send_message(chat_id, chunk) end)
       else
-        Telegram.send_message(chat_id, msg)
+        render(chat_id, mid, msg)
       end
     end
   end
